@@ -24,23 +24,29 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Registra los errores ocurridos durante el procesamiento de updates."""
+    # Registra los errores ocurridos durante el procesamiento de updates.
     logger.error(msg="Excepción al manejar un update:", exc_info=context.error)
 
     if isinstance(update, Update) and update.effective_message:
         await update.effective_message.reply_text(
-            "⚠️ Ocurrió un error inesperado al procesar tu solicitud. Inténtalo más tarde."
+            "Ocurrió un error inesperado al procesar tu solicitud. Inténtalo más tarde."
         )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        f"Hola {update.effective_user.first_name}, ¿quieres ver los juegos gratis de esta semana?\n\n"
+        f"Hola {update.effective_user.first_name}, ¿quieres ver los juegos gratis de esta semana?\n"
+        "/gratis - Juegos gratis de esta semana\n"
+        "/proximos - Juegos gratis de la semana próxima\n"
+        "¡Si me escribes algo distinto te hago eco!"
+    )
+
+async def help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        f"Mis comandos son:\n"
         "/gratis - Juegos gratis de esta semana\n"
         "/proximos - Juegos gratis de la semana próxima"
     )
-
-
 
 async def eco_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     texto_usuario = update.message.text
@@ -89,7 +95,7 @@ async def proximos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def main():
+def main() -> None:
     if not TELEGRAM_TOKEN:
         logger.error("No se encontró el TELEGRAM_TOKEN en el archivo .env")
         return
@@ -98,13 +104,13 @@ def main():
 
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help))
     application.add_handler(CommandHandler("gratis", gratis))
     application.add_handler(CommandHandler("proximos", proximos))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, eco_handler))
 
     application.add_error_handler(error_handler)
 
-    logger.info("🤖 EpikFreeBot iniciado correctamente. Ejecutando polling...")
     application.run_polling()
 
 
