@@ -144,8 +144,10 @@ def describir_error(error: Exception) -> str:
 
     if codigo == 429:                   # 429: se superó la cuota de consultas
         return "Estoy recibiendo demasiadas consultas. Prueba de nuevo en un minuto, por favor."
-    if codigo in (401, 403):            # 401/403: clave inválida o sin permiso
-        return "Tengo un problema de configuración."
+    elif codigo in (401, 403):            # 401/403: clave inválida o sin permiso
+        return "Tengo un problema de configuración. Contacta con el creador."
+    elif codigo == 503:
+        return "No encontré información sobre eso."
     # Cualquier otro caso: falla de red, error del servicio, modelo inexistente.
     return "Tuve un problema para pensar la respuesta. ¿Me lo puedes preguntar de nuevo?"
 

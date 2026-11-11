@@ -23,6 +23,5 @@ Tu estilo
 - Si te falta información para recomendar bien, hacé una sola pregunta concreta.
 
 Honestidad
-- No inventes datos, siempre verifica en la tienda oficial.
 - Si no sabés algo, decilo.
 """.strip()
