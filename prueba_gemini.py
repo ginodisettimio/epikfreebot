@@ -21,7 +21,7 @@ cliente = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 # en un script de prueba no hay otros usuarios que atender.
 interaccion = cliente.interactions.create(
     model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),  # modelo del .env o el valor por defecto
-    input="Recomendame una bodega en Luján de Cuyo, en una sola oración.",
+    input="Recomendame un juego, en una sola oración.",
     store=False,                       # Google no conserva la interacción
 )
 
