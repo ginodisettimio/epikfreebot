@@ -1,4 +1,5 @@
 import asyncio
+import json                             # convierte los resultados de las funciones a texto JSON
 import logging
 import os
 
@@ -16,6 +17,7 @@ from telegram.ext import (
 )
 
 import db
+from herramientas import DECLARACIONES, ejecutar_funcion   # funciones propias del bot
 from prompts import PROMPT_SISTEMA
 from epic import date_range, fetch_games
 
@@ -25,6 +27,10 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 MAX_MENSAJES_HISTORIAL = os.getenv("MAX_MENSAJES_HISTORIAL", 20)
+
+# Cantidad máxima de vueltas del ciclo de function calling en un mismo mensaje.
+# Evita un bucle infinito si el modelo pidiera funciones una y otra vez.
+MAX_VUELTAS_HERRAMIENTAS = 5
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -58,7 +64,8 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/olvidar - Borra nuestra conversación y empezar de cero\n"
         "/gratis - Juegos gratis de esta semana\n"
         "/proximos - Juegos gratis de la semana próxima\n"
-        "También brindo información sobre juegos que esten en la tienda de Epic Games."
+        "También puedo darte información de juegos concretos (fecha, género, "
+        "plataformas y nota) aunque no estén en Epic."
     )
     
 
@@ -127,7 +134,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         respuesta = await consultar_gemini(historial, texto)
     except Exception as error:
-        logger.error("Error al consultar a Gemini: %s", error)
+        logger.exception("Error al consultar a Gemini")
         await update.message.reply_text(describir_error(error))
         # Si la consulta falló, no se guarda nada: así el historial nunca
         # queda con una pregunta sin su respuesta.
@@ -162,18 +169,59 @@ def armar_entrada(historial: list[tuple[str, str]], mensaje_nuevo: str) -> list[
 
 
 async def consultar_gemini(historial: list[tuple[str, str]], mensaje: str) -> str:
-    """Envía a Gemini la conversación completa y devuelve el texto de la respuesta."""
-    interaccion = await cliente_gemini.aio.interactions.create(
-        model=GEMINI_MODEL,
-        system_instruction=PROMPT_SISTEMA,
-        input=armar_entrada(historial, mensaje),  # conversación completa, no solo el último texto
-        store=False,                              # la memoria la administra el bot, no Google
-    )
+    """
+    Envía la conversación a Gemini y resuelve el ciclo de function calling:
+    mientras el modelo pida funciones, se ejecutan y se le devuelven los
+    resultados; cuando responde con texto, se devuelve ese texto.
+    """
+    # Lista de pasos que se envía al modelo. Empieza con el historial y el
+    # mensaje nuevo, y crece dentro de este turno con los pedidos de funciones
+    # y sus resultados. Esos pasos intermedios no se guardan en la base.
+    entrada = armar_entrada(historial, mensaje)
 
-    return interaccion.output_text or "No se me ocurrió nada para responder."
+    for vuelta in range(MAX_VUELTAS_HERRAMIENTAS):
+        interaccion = await cliente_gemini.aio.interactions.create(
+            model=GEMINI_MODEL,
+            system_instruction=PROMPT_SISTEMA,
+            input=entrada,
+            tools=DECLARACIONES,        # funciones que el modelo puede pedir
+            store=False,
+        )
+
+        # Pasos de tipo function_call: el modelo pide ejecutar una función.
+        # Puede pedir más de una en la misma respuesta (por ejemplo, gratis y RAWG).
+        llamadas = [paso for paso in interaccion.steps if paso.type == "function_call"]
+
+        if not llamadas:
+            # Sin pedidos de funciones: el modelo ya redactó la respuesta final.
+            return interaccion.output_text or "No se me ocurrió nada para responder."
+
+        # Se agregan a la entrada TODOS los pasos que devolvió el modelo, sin
+        # modificarlos (incluidos los de razonamiento interno). La API los
+        # necesita para relacionar cada resultado con su pedido.
+        for paso in interaccion.steps:
+            entrada.append(paso.model_dump())
+
+        # Se ejecuta cada función pedida y se agrega su resultado como un paso
+        # function_result. call_id debe coincidir con el id del pedido.
+        for llamada in llamadas:
+            resultado = await ejecutar_funcion(llamada.name, llamada.arguments)
+            entrada.append({
+                "type": "function_result",
+                "call_id": llamada.id,
+                "name": llamada.name,
+                # ensure_ascii=False conserva tildes y ñ en lugar de códigos \u00f1
+                "result": [{"type": "text", "text": json.dumps(resultado, ensure_ascii=False)}],
+            })
+        # Se repite el ciclo: el modelo recibe los resultados y decide si
+        # necesita otra función o si ya puede responder.
+
+    # Se agotaron las vueltas sin respuesta final.
+    logger.warning("Se alcanzó el máximo de %d vueltas de herramientas", MAX_VUELTAS_HERRAMIENTAS)
+    return "No pude completar la consulta. ¿Podés reformular la pregunta?"
 
 
-def describir_error(error: Exception, context: ContextTypes.DEFAULT_TYPE) -> str:
+def describir_error(error: Exception) -> str:
     """Traduce un error de la API a un mensaje comprensible para el usuario."""
 
     # Los errores HTTP de la API traen el código en el atributo status_code.
@@ -189,6 +237,23 @@ def describir_error(error: Exception, context: ContextTypes.DEFAULT_TYPE) -> str
         return "No encontré información sobre eso."
     # Cualquier otro caso: falla de red, error del servicio, modelo inexistente.
     return "Tuve un problema para pensar la respuesta. ¿Me lo puedes preguntar de nuevo?"
+
+
+async def al_fallar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Manejador de errores de python-telegram-bot: se activa cuando una excepción
+    se escapa de un manejador. Registra la traza completa y avisa al usuario
+    si el error ocurrió dentro de una conversación.
+    """
+    # El error que provocó la falla viene en context.error; exc_info hace que
+    # el registrador imprima la traza completa, no solo el mensaje.
+    error = context.error
+    logger.error("Error no controlado en el bot: %s", error, exc_info=error)
+
+    # update puede ser None si el error no se originó en un mensaje concreto.
+    mensaje = update.effective_message if update else None
+    if mensaje is not None:
+        await mensaje.reply_text(describir_error(error))
 
 
 async def al_iniciar(app: Application) -> None:
@@ -217,9 +282,9 @@ def main() -> None:
     application.add_handler(CommandHandler("proximos", proximos))
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
-    application.add_error_handler(describir_error)
+    application.add_error_handler(al_fallar)
 
-    logger.info("Epikfreebot v3 en línea con el modelo %s.", GEMINI_MODEL)
+    logger.info("Epikfreebot v4 en línea con el modelo %s.", GEMINI_MODEL)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
