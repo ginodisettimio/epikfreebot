@@ -1,13 +1,16 @@
 """
-Memoria: historial de conversación en SQLite.
+Memoria: historial de conversación y perfiles de jugador en SQLite.
 
 Cada mensaje (del usuario o del modelo) se guarda como una fila de la tabla
-`mensajes`. Se utiliza aiosqlite, la versión asíncrona de sqlite3, para que
-las operaciones sobre la base no bloqueen al bot mientras atiende a otros
-usuarios.
+`mensajes`, y cada jugador tiene una fila en la tabla `perfiles`. Se utiliza
+aiosqlite, la versión asíncrona de sqlite3, para que las operaciones sobre la
+base no bloqueen al bot mientras atiende a otros usuarios.
 """
 
 import aiosqlite                        # SQLite con soporte para async/await
+import logging                          # registro de eventos en la terminal
+
+logger = logging.getLogger("epikfreebot")   # mismo registrador que bot.py
 
 # Nombre del archivo de la base de datos. Se crea en la carpeta desde la que
 # se ejecuta el bot (la raíz del proyecto). Está excluido por .gitignore (*.db).
@@ -25,14 +28,32 @@ CREATE TABLE IF NOT EXISTS mensajes (
 );
 -- Índice que acelera la búsqueda de los mensajes de un usuario en orden.
 CREATE INDEX IF NOT EXISTS idx_mensajes_usuario ON mensajes (user_id, id);
+
+-- Perfiles de jugador (v5). El id de Telegram identifica al perfil.
+CREATE TABLE IF NOT EXISTS perfiles (
+    user_id        INTEGER PRIMARY KEY,             -- id de Telegram: un perfil por usuario
+    genero         TEXT    NOT NULL,                -- género de videojuego (RPG, acción, ...)
+    juego_favorito TEXT    NOT NULL,
+    plataforma     TEXT    NOT NULL,
+    precio_maximo  INTEGER NOT NULL,                -- en pesos; 0 = sin límite
+    fecha          TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
 async def inicializar() -> None:
-    """Crea la tabla y el índice si todavía no existen."""
+    """Crea las tablas y el índice si todavía no existen."""
     # "async with" abre la conexión y garantiza que se cierre al terminar el
     # bloque, incluso si ocurre un error.
     async with aiosqlite.connect(RUTA_DB) as db:
+        # Si quedó la tabla de la primera versión de la v5 (con teléfono), se
+        # descarta: el esquema nuevo usa el id de Telegram como clave.
+        cursor = await db.execute("PRAGMA table_info(perfiles)")
+        columnas = [fila[1] for fila in await cursor.fetchall()]
+        if "telefono" in columnas:
+            logger.warning("Se descarta la tabla perfiles anterior, que usaba teléfono.")
+            await db.execute("DROP TABLE perfiles")
+
         await db.executescript(ESQUEMA)  # executescript ejecuta varias sentencias SQL
         await db.commit()                # confirma los cambios en el archivo
 
@@ -77,4 +98,48 @@ async def borrar_historial(user_id: int) -> int:
         await db.commit()
         # rowcount indica cuántas filas afectó la última sentencia.
         return cursor.rowcount
-        
+
+
+async def guardar_perfil(user_id: int, perfil) -> None:
+    """Guarda o actualiza el perfil de un usuario (un objeto PerfilUsuario)."""
+    async with aiosqlite.connect(RUTA_DB) as db:
+        # ON CONFLICT actualiza la fila si el usuario ya tenía un perfil.
+        await db.execute(
+            "INSERT INTO perfiles "
+            "(user_id, genero, juego_favorito, plataforma, precio_maximo) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "genero = excluded.genero, "
+            "juego_favorito = excluded.juego_favorito, "
+            "plataforma = excluded.plataforma, "
+            "precio_maximo = excluded.precio_maximo, "
+            "fecha = CURRENT_TIMESTAMP",
+            (
+                user_id,
+                perfil.genero,
+                perfil.juego_favorito,
+                perfil.plataforma,
+                perfil.precio_maximo,
+            ),
+        )
+        await db.commit()
+
+
+async def obtener_perfil(user_id: int) -> dict | None:
+    """Devuelve el perfil del usuario como diccionario, o None si no existe."""
+    async with aiosqlite.connect(RUTA_DB) as db:
+        cursor = await db.execute(
+            "SELECT genero, juego_favorito, plataforma, precio_maximo "
+            "FROM perfiles WHERE user_id = ?",
+            (user_id,),
+        )
+        fila = await cursor.fetchone()
+
+    if fila is None:
+        return None
+    return {
+        "genero": fila[0],
+        "juego_favorito": fila[1],
+        "plataforma": fila[2],
+        "precio_maximo": fila[3],
+    }

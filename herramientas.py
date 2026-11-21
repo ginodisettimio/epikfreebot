@@ -12,12 +12,11 @@ El módulo tiene tres partes:
 import asyncio                        # para ejecutar funciones bloqueantes en un hilo aparte
 import logging                        # registro de eventos en la terminal
 import os                             # para leer las variables del .env
-from datetime import datetime         # para pasar las fechas ISO a formato corto
 
 import httpx                          # cliente HTTP asíncrono
 from dotenv import load_dotenv
 
-from epic import date_range, fetch_games
+from epic import obtener_juegos, rango_fechas
 
 load_dotenv()
 logger = logging.getLogger("epikfreebot")   # mismo registrador que bot.py
@@ -40,62 +39,41 @@ LIMITE_DESCRIPCION = 600
 # 1. Funciones
 # ---------------------------------------------------------------------------
 
-def _fecha_corta(iso: str) -> str:
-    """Convierte una fecha ISO ('2026-11-13T15:00:00.000Z') en '13/11/2026'."""
-    # fromisoformat entiende el formato de la Epic Store; la Z de UTC se
-    # reemplaza por el desplazamiento horario que Python sí reconoce.
-    return datetime.fromisoformat(iso.replace("Z", "+00:00")).strftime("%d/%m/%Y")
-
-
-def _armar_juegos(games: list[dict]) -> list[dict]:
-    """Pasa la lista cruda de epic.py a un formato breve y legible para el modelo."""
-    return [
-        {
-            "titulo": g["title"],
-            "url": g["url"],
-            "precio_normal": g["price"],
-            "inicio": _fecha_corta(g["start"]),
-            "fin": _fecha_corta(g["end"]),
-        }
-        for g in games
-    ]
-
-
 async def juegos_gratis() -> dict:
     """Devuelve los juegos que Epic regala ahora mismo (gratis esta semana)."""
-    # fetch_games es síncrona (usa requests por dentro): asyncio.to_thread la
-    # ejecuta en un hilo de trabajo para no bloquear el bot mientras espera.
+    # obtener_juegos es síncrona (usa requests por dentro): asyncio.to_thread
+    # la ejecuta en un hilo de trabajo para no bloquear el bot mientras espera.
     try:
-        games = await asyncio.to_thread(fetch_games, "current")
+        juegos = await asyncio.to_thread(obtener_juegos, "actuales")
     except Exception as error:
         # El error se devuelve como dato, no como excepción: así el modelo
         # puede explicárselo al usuario sin que el ciclo de herramientas se corte.
         return {"error": f"No se pudo consultar la Epic Games Store: {type(error).__name__}"}
 
-    if not games:
+    if not juegos:
         return {"mensaje": "Esta semana Epic no está regalando juegos."}
 
     return {
-        "periodo": date_range(games),     # '13/11/2026 - 20/11/2026'
-        "cantidad": len(games),
-        "juegos": _armar_juegos(games),
+        "periodo": rango_fechas(juegos),     # '13/11/2026 - 20/11/2026'
+        "cantidad": len(juegos),
+        "juegos": juegos,
     }
 
 
 async def proximos_juegos() -> dict:
     """Devuelve los juegos que Epic va a regalar en la próxima semana."""
     try:
-        games = await asyncio.to_thread(fetch_games, "upcoming")
+        juegos = await asyncio.to_thread(obtener_juegos, "proximos")
     except Exception as error:
         return {"error": f"No se pudo consultar la Epic Games Store: {type(error).__name__}"}
 
-    if not games:
+    if not juegos:
         return {"mensaje": "Todavía no se conocen los juegos gratis de la semana próxima."}
 
     return {
-        "periodo": date_range(games),
-        "cantidad": len(games),
-        "juegos": _armar_juegos(games),
+        "periodo": rango_fechas(juegos),
+        "cantidad": len(juegos),
+        "juegos": juegos,
     }
 
 

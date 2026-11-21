@@ -5,6 +5,7 @@ import os
 
 from dotenv import load_dotenv
 from google import genai
+from pydantic import ValidationError    # error que se produce si el JSON no cumple el esquema
 
 from telegram import LinkPreviewOptions, Update
 from telegram.constants import ChatAction 
@@ -18,8 +19,9 @@ from telegram.ext import (
 
 import db
 from herramientas import DECLARACIONES, ejecutar_funcion   # funciones propias del bot
+from perfil import analizar_perfil, describir_perfil       # perfil estructurado del jugador
 from prompts import PROMPT_SISTEMA
-from epic import date_range, fetch_games
+from epic import obtener_juegos, rango_fechas
 
 
 load_dotenv()
@@ -52,41 +54,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"Hola {update.effective_user.first_name},"
         "¿quieres ver los juegos gratis de esta semana?\n"
-        "Escribe /help para ver mis comandos"
+        "Escribe /ayuda para ver mis comandos. Si querés recomendaciones a tu "
+        "medida, creá tu perfil con /perfil."
     )
 
 
-async def help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"Mis comandos son:\n"
         "/start - Comenzar la conversación\n"
-        "/help - Esta ayuda\n"
+        "/ayuda - Esta ayuda\n"
         "/olvidar - Borra nuestra conversación y empezar de cero\n"
+        "/perfil <texto> - Creá o actualizá tu perfil de jugador\n"
+        "/yo - Ver tu perfil\n"
         "/gratis - Juegos gratis de esta semana\n"
         "/proximos - Juegos gratis de la semana próxima\n"
         "También puedo darte información de juegos concretos (fecha, género, "
-        "plataformas y nota) aunque no estén en Epic."
+        "plataformas y nota) y recomendarte según tu perfil."
     )
     
 
 async def gratis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Devuelve la lista de juegos gratis semanal"""
     try:
-        games = await asyncio.to_thread(fetch_games, "current")
+        juegos = await asyncio.to_thread(obtener_juegos, "actuales")
     except Exception:
         await update.message.reply_text("No pude consultar la Epic Games Store, intenta más tarde.")
         return
 
-    if not games:
+    if not juegos:
         await update.message.reply_text("Esta semana Epic no está regalando juegos.")
         return
 
-    lines = [f"Esta semana ({date_range(games)}). Epic regala:"]
-    lines += [f"{i}. {g['title']} - {g['url']}\n{g['price']}" for i, g in enumerate(games, 1)]
-    
-    
+    lineas = [f"Esta semana ({rango_fechas(juegos)}). Epic regala:"]
+    lineas += [
+        f"{i}. {juego['titulo']} - {juego['url']}\n{juego['precio_normal']}"
+        for i, juego in enumerate(juegos, 1)
+    ]
+
     await update.message.reply_text(
-        "\n".join(lines), 
+        "\n".join(lineas),
         link_preview_options=LinkPreviewOptions(is_disabled=True)
     )
 
@@ -94,20 +101,23 @@ async def gratis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def proximos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Devuelve la lista de juegos gratis de la próxima semana"""
     try:
-        games = await asyncio.to_thread(fetch_games, "upcoming")
+        juegos = await asyncio.to_thread(obtener_juegos, "proximos")
     except Exception:
         await update.message.reply_text("No pude consultar la Epic Games Store, intenta más tarde.")
         return
 
-    if not games:
+    if not juegos:
         await update.message.reply_text("Todavía no se conocen los juegos gratis de la semana próxima.")
         return
 
-    lines = [f"La semana próxima ({date_range(games)}). Epic regalará:"]
-    lines += [f"{i}. {g['title']} - {g['url']}\n{g['price']}" for i, g in enumerate(games, 1)]
-    
+    lineas = [f"La semana próxima ({rango_fechas(juegos)}). Epic regalará:"]
+    lineas += [
+        f"{i}. {juego['titulo']} - {juego['url']}\n{juego['precio_normal']}"
+        for i, juego in enumerate(juegos, 1)
+    ]
+
     await update.message.reply_text(
-        "\n".join(lines), 
+        "\n".join(lineas),
         link_preview_options=LinkPreviewOptions(is_disabled=True)
     )
 
@@ -117,6 +127,70 @@ async def olvidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     borrados = await db.borrar_historial(update.effective_user.id)
     logger.info("Usuario %s borró %d mensajes", update.effective_user.id, borrados)
     await update.message.reply_text("Listo, empezamos de cero. ¿En qué te puedo ayudar?")
+
+
+async def perfil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responde al comando /perfil: analiza el texto y guarda el perfil."""
+    # context.args contiene las palabras escritas después del comando,
+    # separadas por espacios: "/perfil Hola soy Ana" → ["Hola", "soy", "Ana"].
+    texto = " ".join(context.args).strip()
+    if not texto:
+        await update.message.reply_text(
+            "Contame tu perfil en una frase. Por ejemplo:\n"
+            "/perfil Me gustan los RPG, mi juego favorito es Stardew Valley, "
+            "juego en PC y puedo gastar hasta 20000 pesos."
+        )
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    try:
+        datos = await analizar_perfil(cliente_gemini, GEMINI_MODEL, texto)
+    except ValidationError:
+        # El modelo respondió, pero el JSON no cumple el esquema.
+        logger.exception("Perfil con formato inválido")
+        await update.message.reply_text("No pude interpretar tu perfil. ¿Probás escribirlo de nuevo? 🙏")
+        return
+    except Exception as error:
+        logger.exception("Error al analizar el perfil")
+        await update.message.reply_text(describir_error(error))
+        return
+
+    await db.guardar_perfil(update.effective_user.id, datos)
+
+    # El análisis es un objeto: sus campos se usan directamente, sin interpretar texto.
+    await update.message.reply_text(
+        "¡Listo! Guardé tu perfil 🎮\n\n"
+        f"Género de juego: {datos.genero}\n"
+        f"Juego favorito: {datos.juego_favorito}\n"
+        f"Plataforma: {datos.plataforma}\n"
+        f"Precio máximo: {datos.precio_maximo} ARS\n\n"
+        "A partir de ahora tengo en cuenta estos datos para recomendarte juegos. "
+        "Podés actualizarlo cuando quieras con /perfil."
+    )
+
+
+async def yo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responde al comando /yo: muestra el perfil del usuario."""
+    datos = await db.obtener_perfil(update.effective_user.id)
+    if datos is None:
+        await update.message.reply_text(
+            "Todavía no tengo tu perfil. Podés crearlo con /perfil."
+        )
+        return
+
+    limite = (
+        f"{datos['precio_maximo']} ARS"
+        if datos["precio_maximo"]
+        else "sin límite definido"
+    )
+    await update.message.reply_text(
+        "Tu perfil 🎮\n\n"
+        f"Género de juego: {datos['genero']}\n"
+        f"Juego favorito: {datos['juego_favorito']}\n"
+        f"Plataforma: {datos['plataforma']}\n"
+        f"Precio máximo: {limite}"
+    )
 
 
 async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -130,9 +204,12 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Paso 1: recuperar lo que ya se habló con este usuario.
     historial = await db.obtener_historial(user_id, MAX_MENSAJES_HISTORIAL)
 
-    # Paso 2: consultar al modelo con el historial más el mensaje nuevo.
+    # Paso 2: recuperar el perfil, si existe, para personalizar la respuesta.
+    perfil_usuario = await db.obtener_perfil(user_id)
+
+    # Paso 3: consultar al modelo con el historial, el mensaje nuevo y el perfil.
     try:
-        respuesta = await consultar_gemini(historial, texto)
+        respuesta = await consultar_gemini(historial, texto, perfil_usuario)
     except Exception as error:
         logger.exception("Error al consultar a Gemini")
         await update.message.reply_text(describir_error(error))
@@ -140,7 +217,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # queda con una pregunta sin su respuesta.
         return
 
-    # Paso 3: guardar la pregunta y la respuesta para la próxima consulta.
+    # Paso 4: guardar la pregunta y la respuesta para la próxima consulta.
     await db.guardar_intercambio(user_id, texto, respuesta)
 
     for inicio in range(0, len(respuesta), LIMITE_TELEGRAM):
@@ -168,21 +245,33 @@ def armar_entrada(historial: list[tuple[str, str]], mensaje_nuevo: str) -> list[
     return pasos
 
 
-async def consultar_gemini(historial: list[tuple[str, str]], mensaje: str) -> str:
+async def consultar_gemini(
+    historial: list[tuple[str, str]],
+    mensaje: str,
+    perfil: dict | None = None,
+) -> str:
     """
     Envía la conversación a Gemini y resuelve el ciclo de function calling:
     mientras el modelo pida funciones, se ejecutan y se le devuelven los
     resultados; cuando responde con texto, se devuelve ese texto.
+
+    Si el usuario tiene un perfil, se agrega al prompt de sistema para que el
+    modelo tenga en cuenta sus preferencias al recomendar.
     """
     # Lista de pasos que se envía al modelo. Empieza con el historial y el
     # mensaje nuevo, y crece dentro de este turno con los pedidos de funciones
     # y sus resultados. Esos pasos intermedios no se guardan en la base.
     entrada = armar_entrada(historial, mensaje)
 
+    # El prompt de sistema se completa con el perfil del usuario, si lo tiene.
+    instruccion = PROMPT_SISTEMA
+    if perfil:
+        instruccion = f"{instruccion}\n\n{describir_perfil(perfil)}"
+
     for vuelta in range(MAX_VUELTAS_HERRAMIENTAS):
         interaccion = await cliente_gemini.aio.interactions.create(
             model=GEMINI_MODEL,
-            system_instruction=PROMPT_SISTEMA,
+            system_instruction=instruccion,
             input=entrada,
             tools=DECLARACIONES,        # funciones que el modelo puede pedir
             store=False,
@@ -276,15 +365,17 @@ def main() -> None:
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(al_iniciar).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help))
+    application.add_handler(CommandHandler("ayuda", ayuda))
     application.add_handler(CommandHandler("olvidar", olvidar))
+    application.add_handler(CommandHandler("perfil", perfil))
+    application.add_handler(CommandHandler("yo", yo))
     application.add_handler(CommandHandler("gratis", gratis))
     application.add_handler(CommandHandler("proximos", proximos))
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     application.add_error_handler(al_fallar)
 
-    logger.info("Epikfreebot v4 en línea con el modelo %s.", GEMINI_MODEL)
+    logger.info("Epikfreebot v5 en línea con el modelo %s.", GEMINI_MODEL)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
