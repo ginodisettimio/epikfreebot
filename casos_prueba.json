@@ -1,0 +1,42 @@
+[
+  {
+    "pregunta": "¿Qué juegos gratis está regalando Epic esta semana?",
+    "herramienta_esperada": "juegos_gratis",
+    "criterio": "Menciona al menos un juego gratis de esta semana o indica que esta semana no hay juegos, sin inventar títulos ni enlaces."
+  },
+  {
+    "pregunta": "¿Cuáles son los próximos juegos gratis de Epic?",
+    "herramienta_esperada": "proximos_juegos",
+    "criterio": "Menciona los juegos de la próxima semana o aclara que todavía no se conocen."
+  },
+  {
+    "pregunta": "Contame sobre Elden Ring: género, plataformas y nota.",
+    "herramienta_esperada": "informacion_juego",
+    "criterio": "Menciona el género o las plataformas de Elden Ring y no inventa datos que no estén en la ficha."
+  },
+  {
+    "pregunta": "Contame sobre Hades: género y plataformas.",
+    "herramienta_esperada": "informacion_juego",
+    "criterio": "Menciona el género o las plataformas de Hades y no inventa datos que no estén en la ficha."
+  },
+  {
+    "pregunta": "¿Quién ganó el mundial de fútbol de 1986?",
+    "herramienta_esperada": null,
+    "criterio": "No responde la pregunta de fútbol y ofrece con amabilidad volver al tema de los videojuegos y Epic Games."
+  },
+  {
+    "pregunta": "¿Cuánto cuesta la suscripción a PlayStation Plus?",
+    "herramienta_esperada": null,
+    "criterio": "Aclara que no tiene información sobre PlayStation Plus y no inventa un precio."
+  },
+  {
+    "pregunta": "¿Qué juegos gratis hay en Steam esta semana?",
+    "herramienta_esperada": null,
+    "criterio": "Aclara que solo informa sobre Epic Games Store y no inventa juegos de Steam."
+  },
+  {
+    "pregunta": "Recomendame una película para ver el fin de semana.",
+    "herramienta_esperada": null,
+    "criterio": "Aclara que es un bot de videojuegos y ofrece volver al tema de los juegos de Epic."
+  }
+]

@@ -1,3 +1,11 @@
+"""
+EpikFreeBot v6: bot de Telegram sobre los juegos gratis de Epic Games.
+
+Combina memoria en SQLite, function calling para consultar Epic y RAWG,
+perfiles de jugador con salida estructurada y una evaluación automática que
+reutiliza consultar_gemini sin pasar por Telegram.
+"""
+
 import asyncio
 import json                             # convierte los resultados de las funciones a texto JSON
 import logging
@@ -39,6 +47,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx2").setLevel(logging.WARNING)
 # Registrador propio del bot.
 logger = logging.getLogger("epikfreebot")
 # Longitud máxima de un mensaje de Telegram, en caracteres.
@@ -59,11 +68,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"Mis comandos son:\n"
         "/start - Comenzar la conversación\n"
-        "/ayuda - Esta ayuda\n"
+        "/help - Esta ayuda\n"
         "/olvidar - Borra nuestra conversación y empezar de cero\n"
         "/perfil <texto> - Creá o actualizá tu perfil de jugador\n"
         "/yo - Ver tu perfil\n"
@@ -193,12 +202,12 @@ async def yo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Responde con Gemini, teniendo en cuenta la conversación previa."""
+async def procesar_mensaje(update: Update, contenido: list[dict], texto_para_historial: str) -> None:
+    """
+    Pasos comunes a cualquier mensaje (texto, foto o voz): recuperar el
+    historial, consultar al modelo, guardar el intercambio y responder.
+    """
     user_id = update.effective_user.id                  # identifica de quién es la conversación
-    texto = update.message.text
-    logger.info("Mensaje de %s: %s", user_id, texto)
-
     await update.message.chat.send_action(ChatAction.TYPING)
 
     # Paso 1: recuperar lo que ya se habló con este usuario.
@@ -207,47 +216,59 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Paso 2: recuperar el perfil, si existe, para personalizar la respuesta.
     perfil_usuario = await db.obtener_perfil(user_id)
 
-    # Paso 3: consultar al modelo con el historial, el mensaje nuevo y el perfil.
+    # Paso 3: consultar al modelo con el historial, el contenido nuevo y el perfil.
     try:
-        respuesta = await consultar_gemini(historial, texto, perfil_usuario)
+        respuesta = await consultar_gemini(historial, contenido, perfil=perfil_usuario)
     except Exception as error:
-        logger.exception("Error al consultar a Gemini")
+        logger.exception("Error al consultar a Gemini")   # registra el error con la traza completa
         await update.message.reply_text(describir_error(error))
-        # Si la consulta falló, no se guarda nada: así el historial nunca
-        # queda con una pregunta sin su respuesta.
-        return
+        return                                          # si falló, no se guarda nada
 
-    # Paso 4: guardar la pregunta y la respuesta para la próxima consulta.
-    await db.guardar_intercambio(user_id, texto, respuesta)
+    # Paso 4: guardar el intercambio. En la base solo se guarda texto: para
+    # fotos y audios se guardará una descripción breve, no el archivo.
+    await db.guardar_intercambio(user_id, texto_para_historial, respuesta)
 
+    # Paso 5: responder, en partes si supera el límite de Telegram.
     for inicio in range(0, len(respuesta), LIMITE_TELEGRAM):
         await update.message.reply_text(respuesta[inicio:inicio + LIMITE_TELEGRAM])
 
 
-def armar_entrada(historial: list[tuple[str, str]], mensaje_nuevo: str) -> list[dict]:
+async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Responde un mensaje de texto."""
+    texto = update.message.text
+    logger.info("Mensaje de %s: %s", update.effective_user.id, texto)
+    # El texto se convierte en una lista con un solo bloque. En el historial
+    # se guarda el mismo texto.
+    await procesar_mensaje(update, [{"type": "text", "text": texto}], texto)
+
+
+def armar_entrada(historial: list[tuple[str, str]], contenido_nuevo: list[dict]) -> list[dict]:
     """
     Convierte el historial guardado en la lista de pasos (steps) que espera
-    la Interactions API y agrega al final el mensaje nuevo del usuario.
+    la Interactions API y agrega al final el contenido nuevo del usuario.
+
+    contenido_nuevo es una lista de bloques: texto, imagen o audio.
     """
     # Equivalencia entre el rol guardado en la base y el tipo de paso de la API.
     tipo_de_paso = {"user": "user_input", "model": "model_output"}
 
-    # Lista por comprensión: un diccionario por cada fila del historial.
-    # Cada paso indica su tipo y su contenido, que es una lista de bloques;
-    # aquí, un único bloque de texto.
+    # Un diccionario por cada fila del historial. En el historial, el
+    # contenido es siempre un único bloque de texto.
     pasos = [
         {"type": tipo_de_paso[rol], "content": [{"type": "text", "text": texto}]}
         for rol, texto in historial
     ]
 
-    # El último paso es siempre el mensaje que el usuario acaba de enviar.
-    pasos.append({"type": "user_input", "content": [{"type": "text", "text": mensaje_nuevo}]})
+    # El último paso es lo que el usuario acaba de enviar, tal como llegó:
+    # ya es una lista de bloques, así que no se envuelve en otra lista.
+    pasos.append({"type": "user_input", "content": contenido_nuevo})
     return pasos
 
 
 async def consultar_gemini(
     historial: list[tuple[str, str]],
-    mensaje: str,
+    contenido_nuevo: list[dict],
+    registro: list[str] | None = None,
     perfil: dict | None = None,
 ) -> str:
     """
@@ -255,13 +276,16 @@ async def consultar_gemini(
     mientras el modelo pida funciones, se ejecutan y se le devuelven los
     resultados; cuando responde con texto, se devuelve ese texto.
 
+    Si se pasa una lista en `registro`, se agrega en ella el nombre de cada
+    función que el modelo pidió (lo usa evaluar.py).
+
     Si el usuario tiene un perfil, se agrega al prompt de sistema para que el
     modelo tenga en cuenta sus preferencias al recomendar.
     """
     # Lista de pasos que se envía al modelo. Empieza con el historial y el
-    # mensaje nuevo, y crece dentro de este turno con los pedidos de funciones
-    # y sus resultados. Esos pasos intermedios no se guardan en la base.
-    entrada = armar_entrada(historial, mensaje)
+    # contenido nuevo, y crece dentro de este turno con los pedidos de
+    # funciones y sus resultados. Esos pasos intermedios no se guardan en la base.
+    entrada = armar_entrada(historial, contenido_nuevo)
 
     # El prompt de sistema se completa con el perfil del usuario, si lo tiene.
     instruccion = PROMPT_SISTEMA
@@ -294,6 +318,8 @@ async def consultar_gemini(
         # Se ejecuta cada función pedida y se agrega su resultado como un paso
         # function_result. call_id debe coincidir con el id del pedido.
         for llamada in llamadas:
+            if registro is not None:           # solo si se pasó una lista
+                registro.append(llamada.name)  # anota la herramienta pedida
             resultado = await ejecutar_funcion(llamada.name, llamada.arguments)
             entrada.append({
                 "type": "function_result",
@@ -365,7 +391,7 @@ def main() -> None:
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(al_iniciar).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("ayuda", ayuda))
+    application.add_handler(CommandHandler("help", help))
     application.add_handler(CommandHandler("olvidar", olvidar))
     application.add_handler(CommandHandler("perfil", perfil))
     application.add_handler(CommandHandler("yo", yo))
@@ -375,7 +401,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     application.add_error_handler(al_fallar)
 
-    logger.info("Epikfreebot v5 en línea con el modelo %s.", GEMINI_MODEL)
+    logger.info("Epikfreebot v6 en línea con el modelo %s.", GEMINI_MODEL)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
